@@ -29,7 +29,20 @@ func main() {
 		})
 	}
 
-	http.ListenAndServe(":"+port, logMiddleware(proxyHandler))
+	noProxyMiddleware := func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			if r.URL.IsAbs() || r.Method == http.MethodConnect {
+				h.ServeHTTP(rw, r)
+			} else {
+				rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				rw.Header().Set("X-Content-Type-Options", "nosniff")
+				rw.WriteHeader(200)
+				fmt.Fprintln(rw, "no")
+			}
+		})
+	}
+
+	http.ListenAndServe(":"+port, logMiddleware(noProxyMiddleware(proxyHandler)))
 }
 
 type HttpProxy httputil.ReverseProxy
