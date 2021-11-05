@@ -1,7 +1,5 @@
-FROM golang:1.16-alpine
+FROM golang:1.17-alpine
 ARG PORT
 WORKDIR /
 COPY . .
-RUN go mod download
-RUN go build -o ./echo-server ./echo-server
-ENTRYPOINT ["./echo-server"]
+ENTRYPOINT ["./echo"]
