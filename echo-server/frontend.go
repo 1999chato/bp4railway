@@ -1,5 +1,6 @@
 package main
 
+
 var websocketHTML = `
 <html>
     <head>
