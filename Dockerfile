@@ -1,6 +1,7 @@
 FROM golang:1.17-alpine
 ARG PORT
-WORKDIR /
+WORKDIR /go/src/echo-server
 COPY . .
-RUN export CGO_ENABLED=0
-CMD ["sh","./echo"]
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ./echo ./echo-server
+ENTRYPOINT ["./echo"]
