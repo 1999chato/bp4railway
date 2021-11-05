@@ -3,4 +3,4 @@ ARG PORT
 WORKDIR /
 COPY *.go ./
 
-CMD ["go","run","main.go"]
+CMD ["go","run","frontend.go","main.go"]
