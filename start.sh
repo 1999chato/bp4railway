@@ -1,3 +1,6 @@
+#!/bin/sh
+
+cat << EOF > /config.json
 {
     "Type":"Group",
     "Services":{
@@ -8,7 +11,10 @@
         "accept":{
             "Type":"Accept",
             "Agent":"agent://server.agent",
-            "Listen":"tcp://0.0.0.0:PORT"
+            "Listen":"tcp://0.0.0.0:${PORT}"
         }
     }
 }
+EOF
+
+./bp
