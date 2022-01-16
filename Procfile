@@ -1,1 +1,1 @@
-web: bin/bp
+web: bin/server-meta
