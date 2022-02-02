@@ -1,4 +1,4 @@
-package socketserver
+package socket
 
 import (
 	"context"
@@ -14,25 +14,20 @@ import (
 
 var ErrServerClosed = errors.New("socket: Server closed")
 
-type Socket interface {
+type Context struct {
 	net.Conn        // by conn
 	context.Context // by Serve
 }
 
-type socket = struct {
-	net.Conn
-	context.Context
-}
-
-type Handler func(Socket) //close socket when return
+type Handler func(*Context) //close socket when return
 
 func copy(to io.Writer, from io.Reader, done <-chan struct{}) {
 	io.Copy(to, from)
 	<-done
 }
 
-func NewForwardHandler(open func(socket Socket) (net.Conn, error)) Handler {
-	return Handler(func(source Socket) {
+func NewForwardHandler(open func(socket *Context) (net.Conn, error)) Handler {
+	return Handler(func(source *Context) {
 		target, err := open(source)
 		if err != nil {
 			return
@@ -61,7 +56,7 @@ func NewForwardHandler(open func(socket Socket) (net.Conn, error)) Handler {
 
 type Server struct {
 	BaseContext  func(net.Listener) context.Context
-	ErrorHandler func(Socket, ...interface{})
+	ErrorHandler func(*Context, ...interface{})
 	m            sync.Mutex
 	listeners    map[*net.Listener]struct{}
 	open         int32
@@ -132,7 +127,7 @@ func (server *Server) serve(ctx context.Context, conn net.Conn, handler Handler)
 	// ctx, cancel = context.WithCancel(ctx)
 	// defer cancel()
 
-	socket := &socket{conn, ctx}
+	socket := &Context{conn, ctx}
 	defer func() {
 		if server.ErrorHandler != nil {
 			if err := recover(); err != nil {

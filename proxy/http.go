@@ -35,56 +35,40 @@ func (p *HttpProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	// TODO: check port
 
-	backConn, err := p.dial(req.Context(), "tcp", req.URL.Host)
+	target, err := p.dial(req.Context(), "tcp", req.URL.Host)
 	if err != nil {
 		p.getErrorHandler()(rw, req, fmt.Errorf("dial failed on %s: %v", req.Method, err))
 		return
 	}
+	defer target.Close()
 
-	backConnCloseCh := make(chan bool)
-	go func() {
-		select {
-		case <-req.Context().Done():
-		case <-backConnCloseCh:
-		}
-		backConn.Close()
-	}()
-
-	defer close(backConnCloseCh)
-
-	conn, _, err := hj.Hijack()
+	source, _, err := hj.Hijack()
 	if err != nil {
 		p.getErrorHandler()(rw, req, fmt.Errorf("hijack failed on %s: %v", req.Method, err))
 		return
 	}
-	defer conn.Close()
+	defer source.Close()
 
-	_, err = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	_, err = source.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	if err != nil {
 		p.getErrorHandler()(rw, req, fmt.Errorf("write failed on %s: %v", req.Method, err))
 		return
 	}
 
-	errc := make(chan error, 1)
-	cc := connectCopier{user: conn, backend: backConn}
-	go cc.copyToBackend(errc)
-	go cc.copyFromBackend(errc)
-	<-errc
+	done := make(chan struct{})
+	go copy(source, target, done)
+	go copy(target, source, done)
+
+	select {
+	case <-req.Context().Done():
+	case done <- struct{}{}:
+	}
+	close(done)
 }
 
-//see go1.17.1:src/net/http/httputil/reverseproxy.go:616 switchProtocolCopier
-type connectCopier struct {
-	user, backend io.ReadWriter
-}
-
-func (c connectCopier) copyFromBackend(errc chan<- error) {
-	_, err := io.Copy(c.user, c.backend)
-	errc <- err
-}
-
-func (c connectCopier) copyToBackend(errc chan<- error) {
-	_, err := io.Copy(c.backend, c.user)
-	errc <- err
+func copy(to io.Writer, from io.Reader, done <-chan struct{}) {
+	io.Copy(to, from)
+	<-done
 }
 
 func (p *HttpProxy) logf(format string, args ...interface{}) {

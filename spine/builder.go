@@ -1,7 +1,7 @@
 package spine
 
 import (
-	"github.com/dacapoday/server-meta/router"
+	"github.com/dacapoday/server-meta/intranet"
 	"github.com/rs/zerolog"
 )
 
@@ -14,5 +14,5 @@ type ServiceBuilder interface {
 }
 
 type EndpointBuilder interface {
-	Endpoint(network, address string) (router.Endpoint, error)
+	Endpoint(network, address string) (intranet.Endpoint, error)
 }
