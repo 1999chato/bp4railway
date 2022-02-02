@@ -1,13 +1,12 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 
-	"github.com/dacapoday/server-meta/router"
+	"github.com/dacapoday/server-meta/intranet"
 	"github.com/dacapoday/server-meta/spine"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -23,7 +22,7 @@ type BuildService = func(string, Builder) (spine.Service, error)
 
 type Base struct {
 	logger        *zerolog.Logger
-	router        *router.Router
+	intranet      *intranet.Intranet
 	buildServices map[string]BuildService
 }
 
@@ -32,8 +31,8 @@ func (base *Base) Logger(name string) *zerolog.Logger {
 	return &logger
 }
 
-func (base *Base) Endpoint(network, address string) (router.Endpoint, error) {
-	return base.router.Listen(context.Background(), network, address)
+func (base *Base) Endpoint(network, address string) (intranet.Endpoint, error) {
+	return base.intranet.Assume(network, address), nil
 }
 
 func (base *Base) Service(name string) (spine.Service, error) {
@@ -48,8 +47,8 @@ var base *Base
 
 func init() {
 	base = &Base{
-		logger: &log.Logger,
-		router: &router.Router{},
+		logger:   &log.Logger,
+		intranet: &intranet.Intranet{},
 		buildServices: map[string]BuildService{
 			"Group": func(name string, builder Builder) (spine.Service, error) {
 				return BuildGroup(name, builder)
@@ -68,6 +67,9 @@ func init() {
 			},
 			"Proxy": func(name string, builder Builder) (spine.Service, error) {
 				return BuildHttpProxy(name, builder)
+			},
+			"Relay": func(name string, builder Builder) (spine.Service, error) {
+				return BuildRelay(name, builder)
 			},
 		},
 	}

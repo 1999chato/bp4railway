@@ -7,11 +7,12 @@ import (
 	"net"
 	"net/http"
 
+	m "github.com/dacapoday/marshallable"
+	httpserver "github.com/dacapoday/server-meta/http"
+	"github.com/dacapoday/server-meta/intranet"
 	"github.com/dacapoday/server-meta/proxy"
 	"github.com/dacapoday/server-meta/request"
-	"github.com/dacapoday/server-meta/router"
 	"github.com/dacapoday/server-meta/spine"
-	"github.com/dacapoday/server-meta/url"
 	"github.com/rs/zerolog"
 	uuid "github.com/satori/go.uuid"
 )
@@ -20,14 +21,14 @@ type Proxy struct{}
 
 type HttpProxyConfig struct {
 	Type      string
-	Agent     *url.URL
-	Listen    *url.URL
+	Agent     *m.URL
+	Listen    *m.URL
 	BasicAuth string `json:",omitempty"`
 }
 
 type HttpProxy struct {
 	logger *zerolog.Logger
-	assume func(network, address string) (router.Endpoint, error)
+	assume func(network, address string) (intranet.Endpoint, error)
 	config *HttpProxyConfig
 	stop   func() error
 }
@@ -100,9 +101,16 @@ func (agent *HttpProxy) start() (err error) {
 	}
 
 	logger := agent.logger
+	assume := agent.assume
 	config := agent.config
 
-	endpoint, err := agent.assume(
+	listener, err := net.Listen("tcp", config.Listen.Host)
+	if err != nil {
+		return
+	}
+
+	// TODO: more lite, just a dialer, no need close
+	endpoint, err := assume(
 		config.Agent.Scheme,
 		config.Agent.Host,
 	)
@@ -110,39 +118,28 @@ func (agent *HttpProxy) start() (err error) {
 		return
 	}
 
-	listener, err := net.Listen("tcp", config.Listen.Host)
-	if err != nil {
-		endpoint.Close()
-		return
-	}
-
-	dial := func(ctx context.Context, network string, addr string) (conn net.Conn, err error) {
-		//TODO: timeout: endpoint.Timeout
-		conn, err = endpoint.Dial(ctx, config.Agent.Scheme, config.Agent.Host)
-		if err != nil {
-			return
-		}
-
-		traceID := uuid.NewV4().String()
-		err = request.HttpConnect(ctx, conn, addr,
-			http.Header{"X-Trace-Id": []string{traceID}},
-		)
-		return
-	}
-
 	handler := &proxy.HttpProxy{
 		Transport: &http.Transport{
-			DialContext: dial,
+			DialContext: func(ctx context.Context, network string, addr string) (conn net.Conn, err error) {
+				//TODO: timeout: endpoint.Timeout
+				conn, err = endpoint.Dial(ctx, config.Agent.Scheme, config.Agent.Host)
+				if err != nil {
+					return
+				}
+
+				traceID := uuid.NewV4().String()
+				err = request.HttpConnect(ctx, conn, addr,
+					http.Header{"X-Trace-Id": []string{traceID}},
+				)
+				return
+			},
 		},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	server := &http.Server{
-		Addr:        config.Listen.Host,
+	server := &httpserver.Server{
 		BaseContext: func(net.Listener) context.Context { return ctx },
-		Handler:     handler,
 	}
-	server.RegisterOnShutdown(cancel)
 
 	agent.stop = func() (err error) {
 		logger.Info().Msg("stop")
@@ -153,11 +150,12 @@ func (agent *HttpProxy) start() (err error) {
 		if err != nil {
 			logger.Error().Err(err).Msg("stop failed")
 		}
+		cancel()
 		endpoint.Close()
 		return
 	}
 
-	go server.Serve(listener)
+	go server.Serve(listener, handler)
 	return
 }
 

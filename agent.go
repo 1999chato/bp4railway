@@ -7,22 +7,23 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	stdurl "net/url"
+	"net/url"
+	"time"
 
+	m "github.com/dacapoday/marshallable"
+	httpserver "github.com/dacapoday/server-meta/http"
+	"github.com/dacapoday/server-meta/intranet"
 	"github.com/dacapoday/server-meta/proxy"
-	"github.com/dacapoday/server-meta/regexp"
 	"github.com/dacapoday/server-meta/request"
-	"github.com/dacapoday/server-meta/router"
 	"github.com/dacapoday/server-meta/spine"
-	"github.com/dacapoday/server-meta/url"
 	"github.com/rs/zerolog"
 
 	"github.com/dghubble/sling"
 )
 
 type pattern struct {
-	Pattern *regexp.Regexp `json:",omitempty"`
-	Replace string         `json:",omitempty"`
+	Pattern *m.Regexp `json:",omitempty"`
+	Replace string    `json:",omitempty"`
 }
 
 func isSameSlicePattern(a, b []pattern) bool {
@@ -48,13 +49,14 @@ func isSameSlicePattern(a, b []pattern) bool {
 
 type AgentConfig struct {
 	Type     string
-	Agent    *url.URL
+	Agent    *m.URL
 	Patterns []pattern
+	Timeout  time.Duration
 }
 
 type Agent struct {
 	logger *zerolog.Logger
-	assume func(network, address string) (router.Endpoint, error)
+	assume func(network, address string) (intranet.Endpoint, error)
 	config *AgentConfig
 	stop   func() error
 }
@@ -105,13 +107,14 @@ func (agent *Agent) UnmarshalJSON(data []byte) (err error) {
 		needRestart = true
 	}
 
-	if isSameSlicePattern(agent.config.Patterns, config.Patterns) {
+	if !isSameSlicePattern(agent.config.Patterns, config.Patterns) {
 		needRestart = true
 	}
 
 	if len(config.Patterns) == 0 {
+		p := m.MustRegexp(`\w+://(?:\S+\.)?(\w+\.(agent))`)
 		config.Patterns = append(config.Patterns, pattern{
-			Pattern: regexp.MustCompile(`\w+://(?:\S+\.)?(\w+\.(agent))`),
+			Pattern: &p,
 			Replace: "$2://$1",
 		})
 		needRestart = true
@@ -160,7 +163,7 @@ func (agent *Agent) start() (err error) {
 					return endpoint.Dial(ctx, network, addr)
 				}
 
-				if replace, err := stdurl.Parse(pattern.Pattern.ReplaceAllString(target, pattern.Replace)); err == nil {
+				if replace, err := url.Parse(pattern.Pattern.ReplaceAllString(target, pattern.Replace)); err == nil {
 					logger.Debug().Str("target", target).Str("replace", replace.String()).Msg("dial match pattern and replace")
 					return endpoint.Dial(ctx, replace.Scheme, replace.Host)
 				} else {
@@ -174,16 +177,12 @@ func (agent *Agent) start() (err error) {
 		return dialer.DialContext(ctx, network, addr)
 	}
 
-	handler := newAgentHandler(config.Agent, dial, logger)
+	handler := newAgentHandler(config.Agent.URL, dial, logger)
 
 	ctx, cancel := context.WithCancel(context.Background())
-
-	server := &http.Server{
-		Addr:        config.Agent.Host,
+	server := &httpserver.Server{
 		BaseContext: func(net.Listener) context.Context { return ctx },
-		Handler:     handler,
 	}
-	server.RegisterOnShutdown(cancel)
 
 	agent.stop = func() (err error) {
 		logger.Info().Msg("stop")
@@ -194,10 +193,12 @@ func (agent *Agent) start() (err error) {
 		if err != nil {
 			logger.Error().Err(err).Msg("stop failed")
 		}
+		cancel()
+		endpoint.Close()
 		return
 	}
 
-	go server.Serve(endpoint)
+	go server.Serve(endpoint, handler)
 	return
 }
 
@@ -249,7 +250,7 @@ func AccessAgent(doer sling.Doer, agentHost string) AgentClient {
 	})
 }
 
-func (agent AgentClient) GetAgentURL() (addr *stdurl.URL, err error) {
+func (agent AgentClient) GetAgentURL() (addr *url.URL, err error) {
 	var data struct{ Data struct{ Agent string } }
 	resp, err := agent().
 		Get("api/address").
@@ -264,7 +265,7 @@ func (agent AgentClient) GetAgentURL() (addr *stdurl.URL, err error) {
 		return
 	}
 
-	addr, err = stdurl.Parse(data.Data.Agent)
+	addr, err = url.Parse(data.Data.Agent)
 	if err != nil {
 		err = fmt.Errorf("agent.GetAgentURL: %w", err)
 		return

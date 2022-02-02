@@ -7,11 +7,11 @@ import (
 	"net"
 	"net/http"
 
+	m "github.com/dacapoday/marshallable"
+	"github.com/dacapoday/server-meta/intranet"
 	"github.com/dacapoday/server-meta/request"
-	"github.com/dacapoday/server-meta/router"
-	socket "github.com/dacapoday/server-meta/socketserver"
+	"github.com/dacapoday/server-meta/socket"
 	"github.com/dacapoday/server-meta/spine"
-	"github.com/dacapoday/server-meta/url"
 	"github.com/rs/zerolog"
 	uuid "github.com/satori/go.uuid"
 )
@@ -20,14 +20,14 @@ type Forward struct{}
 
 type TcpForwardConfig struct {
 	Type    string
-	Listen  *url.URL
-	Agent   *url.URL
-	Forward *url.URL
+	Listen  *m.URL
+	Agent   *m.URL
+	Forward *m.URL
 }
 
 type TcpForward struct {
 	logger *zerolog.Logger
-	assume func(network, address string) (router.Endpoint, error)
+	assume func(network, address string) (intranet.Endpoint, error)
 	config *TcpForwardConfig
 	stop   func() error
 }
@@ -105,6 +105,11 @@ func (agent *TcpForward) start() (err error) {
 	logger := agent.logger
 	config := agent.config
 
+	listener, err := net.Listen("tcp", config.Listen.Host)
+	if err != nil {
+		return
+	}
+
 	// TODO: more lite, just a dialer, no need close
 	endpoint, err := agent.assume(
 		config.Agent.Scheme,
@@ -114,15 +119,11 @@ func (agent *TcpForward) start() (err error) {
 		return
 	}
 
-	listener, err := net.Listen("tcp", config.Listen.Host)
-	if err != nil {
-		endpoint.Close()
-		return
-	}
+	handler := socket.NewForwardHandler(func(socket *socket.Context) (conn net.Conn, err error) {
+		logger.Info().Str("from", socket.RemoteAddr().String()).Msg("new connection")
 
-	forward := socket.NewForwardHandler(func(socket socket.Socket) (conn net.Conn, err error) {
 		//TODO: timeout: endpoint.Timeout
-		conn, err = endpoint.Dial(socket, config.Agent.Scheme, config.Agent.Host)
+		conn, err = endpoint.Dial(socket.Context, config.Agent.Scheme, config.Agent.Host)
 		if err != nil {
 			return
 		}
@@ -153,7 +154,7 @@ func (agent *TcpForward) start() (err error) {
 		return
 	}
 
-	go server.Serve(listener, forward)
+	go server.Serve(listener, handler)
 
 	return
 }

@@ -4,46 +4,47 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"html"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
-	"github.com/dacapoday/server-meta/router"
-	socket "github.com/dacapoday/server-meta/socketserver"
+	m "github.com/dacapoday/marshallable"
+	httpserver "github.com/dacapoday/server-meta/http"
+	"github.com/dacapoday/server-meta/intranet"
+	"github.com/dacapoday/server-meta/proxy"
+	"github.com/dacapoday/server-meta/socket"
 	"github.com/dacapoday/server-meta/spine"
-	"github.com/dacapoday/server-meta/url"
 	"github.com/hashicorp/yamux"
 	"github.com/rs/zerolog"
 	"nhooyr.io/websocket"
 )
 
 type AcceptConfig struct {
-	Type   string
-	Agent  *url.URL
-	Facade *url.URL
-	Listen *url.URL
+	Type    string
+	Listen  *m.URL
+	Agent   *m.URL
+	Forward *m.URL
 }
 
 type AccessConfig struct {
 	Type  string
-	Agent *url.URL
-	Url   *url.URL
+	Entry *m.URL
+	Agent *m.URL
 }
 
 type Accept struct {
 	logger *zerolog.Logger
-	assume func(network, address string) (router.Endpoint, error)
+	assume func(network, address string) (intranet.Endpoint, error)
 	config *AcceptConfig
 	stop   func() error
 }
 
 type Access struct {
 	logger *zerolog.Logger
-	assume func(network, address string) (router.Endpoint, error)
+	assume func(network, address string) (intranet.Endpoint, error)
 	config *AccessConfig
 	stop   func() error
 }
@@ -127,6 +128,10 @@ func (agent *Accept) UnmarshalJSON(data []byte) (err error) {
 		needRestart = true
 	}
 
+	if agent.config.Forward == nil || agent.config.Forward.String() != config.Forward.String() {
+		needRestart = true
+	}
+
 	// TODO: add dial/listen/shutdown timeout config
 
 	agent.config = &config
@@ -154,7 +159,7 @@ func (agent *Access) UnmarshalJSON(data []byte) (err error) {
 		needRestart = true
 	}
 
-	if agent.config.Url == nil || agent.config.Url.String() != config.Url.String() {
+	if agent.config.Entry == nil || agent.config.Entry.String() != config.Entry.String() {
 		needRestart = true
 	}
 
@@ -182,19 +187,35 @@ func (agent *Accept) start() (err error) {
 	config := agent.config
 	assume := agent.assume
 
-	listen, err := net.Listen("tcp", config.Listen.Host)
+	listener, err := net.Listen("tcp", config.Listen.Host)
 	if err != nil {
 		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	forward := &proxy.HttpProxy{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network string, addr string) (conn net.Conn, err error) {
+				endpoint, err := assume(
+					network,
+					addr,
+				)
+				if err != nil {
+					return
+				}
+
+				//TODO: timeout: endpoint.Timeout
+				conn, err = endpoint.Dial(ctx, config.Forward.Scheme, config.Forward.Host)
+				return
+			},
+		},
+	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
 		if !isWebsocket(r) {
 			logger.Debug().Str("Method", r.Method).Str("URL", r.URL.String()).Msg("Not a websocket request")
-			fmt.Fprintf(w, "Hello, %q", html.EscapeString(r.URL.String()))
+			forward.ServeHTTP(w, r)
 			return
 		}
 
@@ -212,7 +233,7 @@ func (agent *Accept) start() (err error) {
 			return
 		}
 
-		err = connect(ctx, session, assume, config.Agent, logger)
+		err = connect(ctx, session, assume, config.Agent.URL, logger)
 		if err != nil {
 			logger.Warn().Err(err).Msg("connect failed")
 			return
@@ -221,12 +242,10 @@ func (agent *Accept) start() (err error) {
 		ws_conn.Close(websocket.StatusNormalClosure, "")
 	})
 
-	server := &http.Server{
-		Addr:        config.Listen.Host,
+	ctx, cancel := context.WithCancel(context.Background())
+	server := &httpserver.Server{
 		BaseContext: func(net.Listener) context.Context { return ctx },
-		Handler:     handler,
 	}
-	server.RegisterOnShutdown(cancel)
 
 	agent.stop = func() (err error) {
 		logger.Info().Msg("stop")
@@ -237,10 +256,11 @@ func (agent *Accept) start() (err error) {
 		if err != nil {
 			logger.Error().Err(err).Msg("stop failed")
 		}
+		cancel()
 		return
 	}
 
-	go server.Serve(listen)
+	go server.Serve(listener, handler)
 
 	return
 }
@@ -262,28 +282,28 @@ func (agent *Access) start() (err error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	dial := func() (err error) {
-		logger.Debug().Str("Url", config.Url.String()).Msg("connect to remote begin")
-		defer logger.Debug().Str("Url", config.Url.String()).Msg("connect to remote end")
-		ws_conn, response, err := websocket.Dial(ctx, config.Url.String(), nil)
+		logger.Debug().Str("Url", config.Entry.String()).Msg("connect to remote begin")
+		defer logger.Debug().Str("Url", config.Entry.String()).Msg("connect to remote end")
+		ws_conn, response, err := websocket.Dial(ctx, config.Entry.String(), nil)
 		if err != nil {
 			logger.Err(err).Msg("websocket.Dial failed")
 			return
 		}
-		defer ws_conn.Close(websocket.StatusInternalError, "ws dial failed")
 		_ = response // TODO: parse response
 
 		conn := websocket.NetConn(ctx, ws_conn, websocket.MessageBinary)
-
 		session, err := yamux.Client(conn, nil)
 		if err != nil {
+			ws_conn.Close(websocket.StatusInternalError, "ws dial failed")
 			logger.Err(err).Msg("yamux.Client failed")
 			return
 		}
 
-		logger.Debug().Str("Url", config.Url.String()).Msg("connect")
-		err = connect(ctx, session, assume, config.Agent, logger)
+		logger.Debug().Str("Url", config.Entry.String()).Msg("connect")
+		err = connect(ctx, session, assume, config.Agent.URL, logger)
 		if err != nil {
-			logger.Warn().Err(err).Str("Url", config.Url.String()).Msg("connect failed")
+			ws_conn.Close(websocket.StatusInternalError, "ws dial failed")
+			logger.Warn().Err(err).Str("Url", config.Entry.String()).Msg("connect failed")
 			return
 		}
 
@@ -325,7 +345,7 @@ func isWebsocket(r *http.Request) bool {
 		headerContains(r.Header["Upgrade"], "websocket")
 }
 
-func connect(ctx context.Context, session *yamux.Session, assume func(network, address string) (router.Endpoint, error), agentAddr *url.URL, logger *zerolog.Logger) (err error) {
+func connect(ctx context.Context, session *yamux.Session, assume func(network, address string) (intranet.Endpoint, error), agentAddr *url.URL, logger *zerolog.Logger) (err error) {
 	logger.Debug().Msg("connect begin")
 	defer logger.Debug().Msg("connect end")
 
@@ -344,7 +364,7 @@ func connect(ctx context.Context, session *yamux.Session, assume func(network, a
 	}
 	defer server.Close()
 
-	toLocal := socket.NewForwardHandler(func(socket socket.Socket) (conn net.Conn, err error) {
+	toLocal := socket.NewForwardHandler(func(socket *socket.Context) (conn net.Conn, err error) {
 		return remote.Dial(socket, agentAddr.Scheme, agentAddr.Host)
 	})
 
@@ -381,7 +401,7 @@ func connect(ctx context.Context, session *yamux.Session, assume func(network, a
 	}
 	// defer local.Close()
 
-	toRemote := socket.NewForwardHandler(func(socket socket.Socket) (conn net.Conn, err error) {
+	toRemote := socket.NewForwardHandler(func(socket *socket.Context) (conn net.Conn, err error) {
 		return session.Open()
 	})
 

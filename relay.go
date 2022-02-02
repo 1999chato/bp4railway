@@ -8,22 +8,23 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
+	m "github.com/dacapoday/marshallable"
+	"github.com/dacapoday/server-meta/intranet"
 	"github.com/dacapoday/server-meta/request"
-	"github.com/dacapoday/server-meta/router"
-	socket "github.com/dacapoday/server-meta/socketserver"
+	"github.com/dacapoday/server-meta/socket"
 	"github.com/dacapoday/server-meta/spine"
-	"github.com/dacapoday/server-meta/url"
 	"github.com/rs/zerolog"
 )
 
 type RelayConfig struct {
 	Type  string
-	Route []*url.URL
+	Route []m.URL
 }
 
 type Relay struct {
 	logger *zerolog.Logger
-	assume func(network, address string) (router.Endpoint, error)
+	assume func(network, address string) (intranet.Endpoint, error)
 	config *RelayConfig
 	stop   func() error
 }
@@ -61,7 +62,7 @@ func (agent *Relay) UnmarshalJSON(data []byte) (err error) {
 	agent.logger.Info().Msg("UnmarshalJSON")
 	var config RelayConfig
 	if err = json.Unmarshal(data, &config); err != nil {
-		return err
+		return
 	}
 
 	if agent.config.Type != config.Type {
@@ -70,7 +71,7 @@ func (agent *Relay) UnmarshalJSON(data []byte) (err error) {
 
 	var needRestart bool
 
-	if isSameSliceURL(agent.config.Route, config.Route) {
+	if !isSameSliceURL(agent.config.Route, config.Route) {
 		needRestart = true
 	}
 	// TODO: add dial/listen/shutdown timeout config
@@ -97,74 +98,83 @@ func (agent *Relay) start() (err error) {
 	assume := agent.assume
 	config := agent.config
 
-	remoteURL, err := AccessAgent(&http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (conn net.Conn, err error) {
-				endpoint, err := assume(
-					network,
-					addr,
-				)
-				if err != nil {
-					return nil, err
-				}
-				return open(ctx, endpoint, config.Route)
+	ctx, cancel := context.WithCancel(context.Background())
+	dial := func() (err error) {
+		remoteURL, err := AccessAgent(&http.Client{
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (conn net.Conn, err error) {
+					endpoint, err := assume(
+						network,
+						addr,
+					)
+					if err != nil {
+						return nil, err
+					}
+					return open(ctx, endpoint, config.Route)
+				},
+				ForceAttemptHTTP2:     false,
+				MaxIdleConns:          1,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
 			},
-			ForceAttemptHTTP2:     false,
-			MaxIdleConns:          1,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-		Timeout: time.Second * 10,
-	}, "relay").GetAgentURL()
-	if err != nil {
-		return
-	}
+			Timeout: time.Second * 10,
+		}, "relay").GetAgentURL()
+		if err != nil {
+			return
+		}
 
-	listen, err := assume(
-		remoteURL.Scheme,
-		remoteURL.Host,
-	)
-	if err != nil {
-		return
-	}
+		logger.Debug().Msgf("remote: %s", remoteURL)
 
-	forward := socket.NewForwardHandler(func(socket socket.Socket) (net.Conn, error) {
-		addr := socket.RemoteAddr()
-		endpoint, err := assume(
-			addr.Network(),
-			addr.String(),
+		listener, err := assume(
+			remoteURL.Scheme,
+			remoteURL.Host,
 		)
 		if err != nil {
-			return nil, err
+			return
 		}
-		return open(socket, endpoint, config.Route)
-	})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	server := &socket.Server{
-		BaseContext: func(net.Listener) context.Context { return ctx },
+		handler := socket.NewForwardHandler(func(socket *socket.Context) (net.Conn, error) {
+			addr := socket.RemoteAddr()
+			endpoint, err := assume(
+				addr.Network(),
+				addr.String(),
+			)
+			if err != nil {
+				return nil, err
+			}
+			return open(socket.Context, endpoint, config.Route)
+		})
+
+		server := &socket.Server{
+			BaseContext: func(net.Listener) context.Context { return ctx },
+		}
+		defer server.Close()
+
+		go server.Serve(listener, handler)
+
+		<-ctx.Done()
+		return
 	}
 
 	agent.stop = func() (err error) {
 		logger.Info().Msg("stop")
-		err = server.Close()
-		if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
-			err = nil
-		}
-		if err != nil {
-			logger.Err(err).Msg("stop failed")
-		}
 		cancel()
 		return
 	}
 
-	go server.Serve(listen, forward)
+	go backoff.RetryNotify(
+		dial,
+		backoff.WithContext(NewNeverStopBackOff(), ctx),
+		func(e error, d time.Duration) {
+			logger.Warn().Err(e).Dur("duration", d).Msg("retry")
+		},
+	)
 
 	return
 }
 
-func open(ctx context.Context, endpoint router.Endpoint, route []*url.URL) (conn net.Conn, err error) {
+func open(ctx context.Context, endpoint intranet.Endpoint, route []m.URL) (conn net.Conn, err error) {
 	if len(route) == 0 {
 		return nil, errors.New("route is empty")
 	}
@@ -175,11 +185,14 @@ func open(ctx context.Context, endpoint router.Endpoint, route []*url.URL) (conn
 	}
 	for _, r := range route[1:] {
 		err = request.HttpConnect(ctx, conn, r.Host, nil)
+		if err != nil {
+			return
+		}
 	}
 	return
 }
 
-func isSameSliceURL(a, b []*url.URL) bool {
+func isSameSliceURL(a, b []m.URL) bool {
 	if (a == nil) != (b == nil) {
 		return false
 	}

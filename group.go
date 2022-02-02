@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"sync"
 
 	"github.com/dacapoday/server-meta/spine"
 	"github.com/rs/zerolog"
@@ -27,11 +28,17 @@ func BuildGroup(name string, builder interface {
 }
 
 func (group *Group) Close() (err error) {
+	wg := sync.WaitGroup{}
 	for _, service := range group.Services {
-		if err := service.Close(); err != nil {
-			group.logger.Error().Err(err).Msg("service.Close")
-		}
+		wg.Add(1)
+		go func(service spine.Service) {
+			if err := service.Close(); err != nil {
+				group.logger.Err(err).Msg("service.Close")
+			}
+			wg.Done()
+		}(service)
 	}
+	wg.Wait()
 	return
 }
 
