@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 )
 
 type Alg string
@@ -17,18 +18,52 @@ const NoneAlg = Alg("none")
 const Ed25519Alg = Alg("ed25519")
 
 var ErrVerifySign = errors.New("verify sign failed")
-var ErrNoSign = errors.New("not allow no sign")
+var ErrVerifyKeyNotFound = errors.New("verify key no found")
+var ErrNoneSign = errors.New("not allow none sign")
+var ErrShouldNoKey = errors.New("should no key")
+var ErrNoSign = errors.New("sign no found")
 var ErrUnkonwnAlgorithm = errors.New("unknown algorithm")
 
-type KeyStore interface {
+type State interface {
 	GetKey(Domain string) (Algorithm Alg, Key []byte, err error)
 	SetKey(Domain string, Algorithm Alg, Key []byte) (err error)
 }
 
+type LocalState sync.Map
+
+type key struct {
+	Algorithm Alg
+	Key       []byte
+}
+
+func (s *LocalState) GetKey(Domain string) (Algorithm Alg, Key []byte, err error) {
+	m := (*sync.Map)(s)
+	v, ok := m.Load(Domain)
+	if !ok {
+		return
+	}
+
+	k, ok := v.(*key)
+	if !ok {
+		err = errors.New("key type error")
+		return
+	}
+
+	Algorithm = k.Algorithm
+	Key = k.Key
+	return
+}
+
+func (s *LocalState) SetKey(Domain string, Algorithm Alg, Key []byte) (err error) {
+	m := (*sync.Map)(s)
+	m.Store(Domain, &key{Algorithm, Key})
+	return
+}
+
 type Notarize struct {
-	AllowNoSign bool
-	Keys        KeyStore
-	Rand        io.Reader
+	AllowNoneSign bool
+	State         State
+	Rand          io.Reader
 }
 
 func (n *Notarize) GenerateKey(Algorithm Alg) (VerifyKey, SignKey []byte, err error) {
@@ -37,7 +72,7 @@ func (n *Notarize) GenerateKey(Algorithm Alg) (VerifyKey, SignKey []byte, err er
 		VerifyKey, SignKey, err = ed25519.GenerateKey(n.Rand)
 		return
 	case NoneAlg:
-		err = errors.New("none algorithm")
+		err = ErrShouldNoKey
 		return
 	default:
 		err = ErrUnkonwnAlgorithm
@@ -46,11 +81,18 @@ func (n *Notarize) GenerateKey(Algorithm Alg) (VerifyKey, SignKey []byte, err er
 }
 
 func (n *Notarize) GetVerifyKey(Domain string, Algorithm Alg) (key []byte, err error) {
+	algorithm, key, err := n.State.GetKey(Domain)
+	if err != nil {
+		return
+	}
+	if key != nil && algorithm != Algorithm {
+		err = ErrUnkonwnAlgorithm
+	}
 	return
 }
 
 func (n *Notarize) SetVerifyKey(Domain string, Algorithm Alg, key []byte) (err error) {
-	return
+	return n.State.SetKey(Domain, Algorithm, key)
 }
 
 /*
@@ -102,7 +144,7 @@ func (n *Notarize) GenerateToken(payload []byte, Domain string, Algorithm Alg, S
 		return
 	case NoneAlg:
 		if SignKey != nil || NewVerifyKey != nil {
-			err = errors.New("should no key")
+			err = ErrShouldNoKey
 			return
 		}
 		token = base64.RawURLEncoding.EncodeToString([]byte(`{"A":"none"}`)) + "." + encodedPayload
@@ -143,8 +185,8 @@ func (n *Notarize) GetPayloadFromToken(token string) (payload []byte, err error)
 	Algorithm := Alg(header["A"])
 	switch Algorithm {
 	case NoneAlg:
-		if !n.AllowNoSign {
-			err = ErrNoSign
+		if !n.AllowNoneSign {
+			err = ErrNoneSign
 		}
 		return
 	case Ed25519Alg:
@@ -181,7 +223,8 @@ func (n *Notarize) GetPayloadFromToken(token string) (payload []byte, err error)
 
 		if verifyKey == nil {
 			if newVerifyKey == nil {
-				err = errors.New("no verify key")
+				err = ErrVerifyKeyNotFound
+				return
 			} else {
 				verifyKey = newVerifyKey
 			}

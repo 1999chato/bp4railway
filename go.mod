@@ -3,6 +3,7 @@ module bypaths
 go 1.17
 
 require (
+	github.com/cenkalti/backoff/v4 v4.1.2
 	github.com/rs/zerolog v1.26.1
 	github.com/satori/go.uuid v1.2.0
 	nhooyr.io/websocket v1.8.7
