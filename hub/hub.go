@@ -5,6 +5,7 @@ import (
 	"bypaths/notary"
 	"bypaths/socket"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -15,35 +16,24 @@ import (
 	"nhooyr.io/websocket"
 )
 
-type Access struct {
-	Domain string
-
-	Verify string // default: "ed25519"
-	Secret string // ed25519 public key
-	Sign   string
-
+type Policy struct {
 	Dial   string
 	Listen string
 }
 
-func (access *Access) String() string {
-	return access.Domain + ":" + access.Listen + ":" + access.Dial
-}
-
 type Hub struct {
 	Notarize *notary.Notarize
-	intranet *intranet.Intranet
+	Intranet *intranet.Intranet
 	Logger   *zerolog.Logger
 }
 
 func NewHub() *Hub {
 	return &Hub{
-		intranet: &intranet.Intranet{},
+		Notarize: &notary.Notarize{
+			State: &notary.LocalState{},
+		},
+		Intranet: &intranet.Intranet{},
 	}
-}
-
-func (s *Hub) Connect(access *Access) (conn net.Conn, err error) {
-	return
 }
 
 func (s *Hub) response(w http.ResponseWriter, status int, body []byte, contentType string) {
@@ -73,23 +63,32 @@ func (s *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	logger.Debug().Msg("handle DecodeToken")
-	stat, err := s.Notarize.GetStatementFromToken(token)
+	Payload, Domain, _, _, _, _, err := s.Notarize.DecodeToken(token)
 	if err != nil {
 		s.response(w, http.StatusUnauthorized, nil, "")
 		logger.Err(err).Str("token", token).Msg(http.StatusText(http.StatusUnauthorized))
 		return
 	}
 
-	logger = logger.With().Stringer("stat", stat).Logger()
+	logger = logger.With().Bytes("Payload", Payload).Str("Domain", Domain).Logger()
+
+	logger.Debug().Msg("handle DecodePayload")
+	var policy Policy
+	err = json.Unmarshal(Payload, &policy)
+	if err != nil {
+		s.response(w, http.StatusBadRequest, nil, "")
+		logger.Err(err).Msg("invalid payload")
+		return
+	}
 
 	logger.Debug().Msg("handle websocket")
 	if !IsWebsocketRequest(r) {
-		if access.Listen == "" && access.Dial == "" {
-			s.response(w, http.StatusOK, nil, "")
+		if policy.Listen != "" || policy.Dial != "" {
+			s.response(w, http.StatusBadRequest, nil, "")
+			logger.Error().Msg("not a websocket request")
 			return
 		}
 		s.response(w, http.StatusOK, nil, "")
-		logger.Err(errors.New("not a websocket request")).Interface("header", r.Header).Msg(http.StatusText(http.StatusBadRequest))
 		return
 	}
 
@@ -114,44 +113,53 @@ func (s *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
 
 		server := &socket.Server{
 			BaseContext: func(l net.Listener) context.Context { return ctx },
 		}
 		defer server.Close()
 
-		go func() {
-			err := server.Serve(session, toLocal)
-			if err != nil {
-				logger.Warn().Err(err).Msg("toLocal done")
-			} else {
-				logger.Debug().Msg("toLocal done")
-			}
-			cancel()
-		}()
+		if policy.Dial != "" {
+			policyDial := socket.NewForwardHandler(func(socket *socket.Context) (conn net.Conn, err error) {
+				return s.Intranet.Dial(socket, Domain, policy.Dial)
+			})
 
-		targetURL := identity.URL
-		target := s.intranet.Assume(targetURL.Scheme, targetURL.Host)
+			go func() {
+				err := server.Serve(session, policyDial)
+				if err != nil {
+					logger.Warn().Err(err).Msg("policy Dial done")
+				} else {
+					logger.Debug().Msg("policy Dial done")
+				}
+				cancel()
+			}()
+		}
 
-		toRemote := socket.NewForwardHandler(func(socket *socket.Context) (conn net.Conn, err error) {
-			return session.Open()
-		})
+		if policy.Listen != "" {
+			policyListen := socket.NewForwardHandler(func(socket *socket.Context) (conn net.Conn, err error) {
+				return session.Open()
+			})
+			target := s.Intranet.Assume(Domain, policy.Listen)
+			go func() {
+				err := server.Serve(target, policyListen)
+				if err != nil {
+					logger.Warn().Err(err).Msg("toLocal done")
+				} else {
+					logger.Debug().Msg("toLocal done")
+				}
+				cancel()
+			}()
+		}
 
-		go func() {
-			err := server.Serve(target, toRemote)
-			if err != nil {
-				logger.Warn().Err(err).Msg("toLocal done")
-			} else {
-				logger.Debug().Msg("toLocal done")
-			}
-			cancel()
-		}()
+		logger.Info().Msg("connected")
 
 		//TODO: add heartbeat when no traffic (yamux has internal loop, so follow yamux.accept and close all)
 
-		<-ctx.Done()
-		err = ctx.Err()
-
+		if policy.Listen != "" || policy.Dial != "" {
+			<-ctx.Done()
+			err = ctx.Err()
+		}
 	}
 
 	ws_conn.Close(websocket.StatusNormalClosure, "")

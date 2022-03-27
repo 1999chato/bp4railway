@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"sync"
 )
 
 type Alg string
@@ -27,37 +26,6 @@ var ErrUnkonwnAlgorithm = errors.New("unknown algorithm")
 type State interface {
 	GetKey(Domain string) (Algorithm Alg, Key []byte, err error)
 	SetKey(Domain string, Algorithm Alg, Key []byte) (err error)
-}
-
-type LocalState sync.Map
-
-type key struct {
-	Algorithm Alg
-	Key       []byte
-}
-
-func (s *LocalState) GetKey(Domain string) (Algorithm Alg, Key []byte, err error) {
-	m := (*sync.Map)(s)
-	v, ok := m.Load(Domain)
-	if !ok {
-		return
-	}
-
-	k, ok := v.(*key)
-	if !ok {
-		err = errors.New("key type error")
-		return
-	}
-
-	Algorithm = k.Algorithm
-	Key = k.Key
-	return
-}
-
-func (s *LocalState) SetKey(Domain string, Algorithm Alg, Key []byte) (err error) {
-	m := (*sync.Map)(s)
-	m.Store(Domain, &key{Algorithm, Key})
-	return
 }
 
 type Notarize struct {
@@ -81,6 +49,9 @@ func (n *Notarize) GenerateKey(Algorithm Alg) (VerifyKey, SignKey []byte, err er
 }
 
 func (n *Notarize) GetVerifyKey(Domain string, Algorithm Alg) (key []byte, err error) {
+	if n.State == nil {
+		return
+	}
 	algorithm, key, err := n.State.GetKey(Domain)
 	if err != nil {
 		return
@@ -92,29 +63,32 @@ func (n *Notarize) GetVerifyKey(Domain string, Algorithm Alg) (key []byte, err e
 }
 
 func (n *Notarize) SetVerifyKey(Domain string, Algorithm Alg, key []byte) (err error) {
+	if n.State == nil {
+		return
+	}
 	return n.State.SetKey(Domain, Algorithm, key)
 }
 
 /*
-Token = Type "." Payload "." Signature
-	  | Type "." Payload
+Token = Header "." Payload "." Signature
+	  | Header "." Payload
 
 Payload = Base64(raw)
 
-Type = Base64({"D":"","A":"","K":""})
+Header = Base64({"D":"","A":"","K":""})
 D = Domain is optional, else use global domain.
 A = Algorithm is optional, default is "ed25519". algoritm can't change if not none.
 K = Key is optional, if set means upsert new verify key
 
-Signature = Base64(sign[Algorithm](Type+"."+Payload, SignKey))
+Signature = Base64(sign[Algorithm](Header+"."+Payload, SignKey))
 */
 
-func (n *Notarize) GenerateToken(payload []byte, Domain string, Algorithm Alg, SignKey []byte, NewVerifyKey []byte) (token string, err error) {
-	if payload == nil {
+func (n *Notarize) EncodeToken(Payload []byte, Domain string, Algorithm Alg, SignKey []byte, NewVerifyKey []byte) (token string, err error) {
+	if Payload == nil {
 		err = errors.New("payload is nil")
 		return
 	}
-	encodedPayload := base64.RawURLEncoding.EncodeToString(payload)
+	encodedPayload := base64.RawURLEncoding.EncodeToString(Payload)
 
 	switch Algorithm {
 	case Ed25519Alg:
@@ -123,19 +97,19 @@ func (n *Notarize) GenerateToken(payload []byte, Domain string, Algorithm Alg, S
 			return
 		}
 
-		header := map[string]string{"A": string(Ed25519Alg)}
+		Header := map[string]string{"A": string(Ed25519Alg)}
 		if Domain != "" {
-			header["D"] = Domain
+			Header["D"] = Domain
 		}
 		if NewVerifyKey != nil {
-			header["K"] = base64.RawURLEncoding.EncodeToString(NewVerifyKey)
+			Header["K"] = base64.RawURLEncoding.EncodeToString(NewVerifyKey)
 		}
-		var Header []byte
-		Header, err = json.Marshal(header)
+		var header []byte
+		header, err = json.Marshal(Header)
 		if err != nil {
 			return
 		}
-		encodedHeader := base64.RawURLEncoding.EncodeToString(Header)
+		encodedHeader := base64.RawURLEncoding.EncodeToString(header)
 
 		token = encodedHeader + "." + encodedPayload
 		sign := ed25519.Sign(SignKey, []byte(token))
@@ -155,7 +129,7 @@ func (n *Notarize) GenerateToken(payload []byte, Domain string, Algorithm Alg, S
 	}
 }
 
-func (n *Notarize) GetPayloadFromToken(token string) (payload []byte, err error) {
+func (n *Notarize) DecodeToken(token string) (Payload []byte, Domain string, Algorithm Alg, Sign []byte, NewVerifyKey []byte, VerifyKey []byte, err error) {
 	segment := strings.Split(token, ".")
 	if len(segment) < 2 {
 		err = errors.New("token format error")
@@ -163,26 +137,26 @@ func (n *Notarize) GetPayloadFromToken(token string) (payload []byte, err error)
 	}
 
 	encodedPayload := segment[1]
-	payload, err = base64.RawURLEncoding.DecodeString(encodedPayload)
+	Payload, err = base64.RawURLEncoding.DecodeString(encodedPayload)
 	if err != nil {
 		err = fmt.Errorf("token format error: %w", err)
 		return
 	}
 
 	encodedHeader := segment[0]
-	Header, err := base64.RawURLEncoding.DecodeString(encodedHeader)
+	header, err := base64.RawURLEncoding.DecodeString(encodedHeader)
 	if err != nil {
 		err = fmt.Errorf("token format error: %w", err)
 		return
 	}
-	var header map[string]string
-	err = json.Unmarshal(Header, &header)
+	var Header map[string]string
+	err = json.Unmarshal(header, &Header)
 	if err != nil {
 		err = fmt.Errorf("token format error: %w", err)
 		return
 	}
 
-	Algorithm := Alg(header["A"])
+	Algorithm = Alg(Header["A"])
 	switch Algorithm {
 	case NoneAlg:
 		if !n.AllowNoneSign {
@@ -196,49 +170,46 @@ func (n *Notarize) GetPayloadFromToken(token string) (payload []byte, err error)
 		}
 
 		encodedSign := segment[2]
-		var sign []byte
-		sign, err = base64.RawURLEncoding.DecodeString(encodedSign)
+		Sign, err = base64.RawURLEncoding.DecodeString(encodedSign)
 		if err != nil {
 			err = fmt.Errorf("sign format error: %w", err)
 			return
 		}
 
 		body := []byte(encodedHeader + "." + encodedPayload)
-		Domain := header["D"]
+		Domain = Header["D"]
 
-		var newVerifyKey []byte
-		if key, ok := header["K"]; ok {
-			newVerifyKey, err = base64.RawURLEncoding.DecodeString(key)
+		if key, ok := Header["K"]; ok {
+			NewVerifyKey, err = base64.RawURLEncoding.DecodeString(key)
 			if err != nil {
 				err = fmt.Errorf("verify key format error: %w", err)
 				return
 			}
 		}
 
-		var verifyKey []byte
-		verifyKey, err = n.GetVerifyKey(Domain, Algorithm)
+		VerifyKey, err = n.GetVerifyKey(Domain, Algorithm)
 		if err != nil {
 			return
 		}
 
-		if verifyKey == nil {
-			if newVerifyKey == nil {
+		if VerifyKey == nil {
+			if NewVerifyKey == nil {
 				err = ErrVerifyKeyNotFound
 				return
 			} else {
-				verifyKey = newVerifyKey
+				VerifyKey = NewVerifyKey
 			}
-		} else if bytes.Equal(newVerifyKey, verifyKey) {
-			newVerifyKey = nil
+		} else if bytes.Equal(NewVerifyKey, VerifyKey) {
+			NewVerifyKey = nil
 		}
 
-		if !ed25519.Verify(verifyKey, body, sign) {
+		if !ed25519.Verify(VerifyKey, body, Sign) {
 			err = ErrVerifySign
 			return
 		}
 
-		if newVerifyKey != nil {
-			err = n.SetVerifyKey(Domain, Algorithm, newVerifyKey)
+		if NewVerifyKey != nil {
+			err = n.SetVerifyKey(Domain, Algorithm, NewVerifyKey)
 			if err != nil {
 				return
 			}
